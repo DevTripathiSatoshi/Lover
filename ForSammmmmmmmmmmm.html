@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Hand Tracking - Glowing Heart</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background-color: #050002;
+            overflow: hidden;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        #webcam {
+            display: none;
+        }
+
+        #canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            transform: scaleX(-1);
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ff4d6d;
+            font-size: 20px;
+            font-weight: bold;
+            text-shadow: 0 0 10px #ff0055;
+            pointer-events: none;
+            transition: opacity 0.5s ease;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="loading">Initializing Camera & AI Tracking... Please Allow Camera Access.</div>
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="canvas"></canvas>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingElement = document.getElementById('loading');
+
+        let width = canvasElement.width = window.innerWidth;
+        let height = canvasElement.height = window.innerHeight;
+
+        window.addEventListener('resize', () => {
+            width = canvasElement.width = window.innerWidth;
+            height = canvasElement.height = window.innerHeight;
+        });
+
+        const colors = ["#ff0055", "#ff4d6d", "#ff758f", "#800020", "#ff007f", "#4a0010"];
+
+        let trailParticles = [];
+        let backgroundHearts = [];
+        let isTwoFistsActive = false;
+        let lastPositions = {};
+        let handStates = {};
+        let globalTwoFistsSince = 0;
+        let globalTwoFistsIntended = false;
+
+        class TrailParticle {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+                this.size = Math.random() * 4 + 2;
+                this.color = colors[Math.floor(Math.random() * colors.length)];
+                this.alpha = 1.0;
+                this.life = 1.0;
+                // Slower decay so user can draw hearts and write things
+                this.decay = Math.random() * 0.0002 + 0.0004; // ~1 minute fade
+                this.vx = (Math.random() - 0.5) * 0.15; // Reduced scatter
+                this.vy = (Math.random() - 0.5) * 0.15; // Reduced scatter
+            }
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                this.life -= this.decay;
+                this.alpha = Math.max(0, this.life);
+            }
+            draw() {
+                if (this.alpha <= 0) return;
+                canvasCtx.save();
+                canvasCtx.globalAlpha = this.alpha;
+                canvasCtx.fillStyle = this.color;
+                canvasCtx.shadowBlur = 15;
+                canvasCtx.shadowColor = this.color;
+                canvasCtx.beginPath();
+                canvasCtx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                canvasCtx.fill();
+                canvasCtx.restore();
+            }
+        }
+
+        class FloatingHeart {
+            constructor(x, y) {
+                this.x = x || Math.random() * width;
+                this.y = y || height + 50;
+                this.baseSize = Math.random() * 1.5 + 0.5;
+                this.color = colors[Math.floor(Math.random() * colors.length)];
+                this.alpha = Math.random() * 0.6 + 0.4;
+                this.vy = Math.random() * -5 - 3; // Fast float up
+                this.vx = Math.sin(this.y * 0.05) * 3;
+                this.scale = 0;
+                this.maxScale = this.baseSize;
+                this.angle = (Math.random() - 0.5) * 0.5;
+            }
+            update() {
+                this.y += this.vy;
+                this.vx = Math.sin(this.y * 0.02) * 3;
+                this.x += this.vx;
+                if (this.scale < this.maxScale) this.scale += 0.05;
+            }
+            draw() {
+                canvasCtx.save();
+                canvasCtx.globalAlpha = this.alpha;
+                canvasCtx.fillStyle = this.color;
+                canvasCtx.shadowBlur = 15;
+                canvasCtx.shadowColor = this.color;
+                canvasCtx.translate(this.x, this.y);
+                canvasCtx.scale(this.scale, this.scale);
+                canvasCtx.rotate(this.angle);
+
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(0, 0);
+                canvasCtx.bezierCurveTo(0, -3, -5, -15, -15, -15);
+                canvasCtx.bezierCurveTo(-30, -15, -30, -2.5, -30, -2.5);
+                canvasCtx.bezierCurveTo(-30, 10, -15, 21, 0, 30);
+                canvasCtx.bezierCurveTo(15, 21, 30, 10, 30, -2.5);
+                canvasCtx.bezierCurveTo(30, -2.5, 30, -15, 15, -15);
+                canvasCtx.bezierCurveTo(5, -15, 0, -3, 0, 0);
+                canvasCtx.fill();
+
+                canvasCtx.restore();
+            }
+        }
+
+        function getFingerStates(landmarks) {
+            const wrist = landmarks[0];
+            const states = { index: false, middle: false, ring: false, pinky: false };
+            const fingers = {
+                index: { tip: 8, pip: 6 },
+                middle: { tip: 12, pip: 10 },
+                ring: { tip: 16, pip: 14 },
+                pinky: { tip: 20, pip: 18 }
+            };
+            for (let name in fingers) {
+                const f = fingers[name];
+                const tipDist = Math.hypot(landmarks[f.tip].x - wrist.x, landmarks[f.tip].y - wrist.y);
+                const pipDist = Math.hypot(landmarks[f.pip].x - wrist.x, landmarks[f.pip].y - wrist.y);
+                if (name === 'index') {
+                    states[name] = tipDist > pipDist * 0.9;
+                } else {
+                    states[name] = tipDist > pipDist * 1.15;
+                }
+            }
+            return states;
+        }
+
+        function onResults(results) {
+            if (loadingElement) {
+                loadingElement.style.opacity = 0;
+            }
+
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, width, height);
+            canvasCtx.drawImage(results.image, 0, 0, width, height);
+
+            canvasCtx.fillStyle = "rgba(5, 0, 2, 0.45)";
+            canvasCtx.fillRect(0, 0, width, height);
+            canvasCtx.restore();
+
+            let fistCount = 0;
+            let currentHands = [];
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                    const landmarks = results.multiHandLandmarks[i];
+                    const handLabel = (results.multiHandedness && results.multiHandedness[i]) ? results.multiHandedness[i].label : `Hand${i}`;
+                    currentHands.push(handLabel);
+
+                    if (!handStates[handLabel]) {
+                        handStates[handLabel] = { intended: 'none', since: Date.now() };
+                    }
+
+                    const states = getFingerStates(landmarks);
+                    const isFist = !states.index && !states.middle && !states.ring && !states.pinky;
+                    const isSlap = states.index && states.middle && states.ring && states.pinky;
+                    const isDrawing = states.index && !states.middle && !states.ring && !states.pinky;
+
+                    let detectedAction = 'none';
+                    if (isFist) detectedAction = 'fist';
+                    else if (isSlap) detectedAction = 'eraser';
+                    else if (isDrawing) detectedAction = 'pen';
+
+                    if (handStates[handLabel].intended !== detectedAction) {
+                        handStates[handLabel].intended = detectedAction;
+                        handStates[handLabel].since = Date.now();
+                        lastPositions[handLabel] = null;
+                    }
+
+                    const timeInState = Date.now() - handStates[handLabel].since;
+                    const isCooldown = timeInState < 1000;
+
+                    const palmX = landmarks[9].x * width;
+                    const palmY = landmarks[9].y * height;
+                    const ix = landmarks[8].x * width;
+                    const iy = landmarks[8].y * height;
+
+                    if (detectedAction === 'fist') {
+                        fistCount++;
+                    } else if (detectedAction === 'eraser') {
+                        const eraseRadius = 120;
+                        if (isCooldown) {
+                            canvasCtx.save();
+                            canvasCtx.globalAlpha = 0.4;
+                            canvasCtx.fillStyle = "#000000";
+                            canvasCtx.beginPath();
+                            canvasCtx.arc(palmX, palmY, eraseRadius, 0, Math.PI * 2);
+                            canvasCtx.fill();
+                            canvasCtx.restore();
+                        } else {
+                            trailParticles = trailParticles.filter(p => {
+                                return Math.hypot(p.x - palmX, p.y - palmY) > eraseRadius;
+                            });
+
+                            canvasCtx.save();
+                            canvasCtx.globalAlpha = 0.15;
+                            canvasCtx.fillStyle = "#ffffff";
+                            canvasCtx.beginPath();
+                            canvasCtx.arc(palmX, palmY, eraseRadius, 0, Math.PI * 2);
+                            canvasCtx.fill();
+                            canvasCtx.restore();
+                        }
+                    } else if (detectedAction === 'pen') {
+                        const penRadius = 15;
+                        if (isCooldown) {
+                            canvasCtx.save();
+                            canvasCtx.globalAlpha = 0.6;
+                            canvasCtx.fillStyle = "#000000";
+                            canvasCtx.beginPath();
+                            canvasCtx.arc(ix, iy, penRadius, 0, Math.PI * 2);
+                            canvasCtx.fill();
+                            canvasCtx.restore();
+
+                            lastPositions[handLabel] = null;
+                        } else {
+                            canvasCtx.save();
+                            canvasCtx.globalAlpha = 0.6;
+                            canvasCtx.fillStyle = "#ff4d6d";
+                            canvasCtx.beginPath();
+                            canvasCtx.arc(ix, iy, penRadius, 0, Math.PI * 2);
+                            canvasCtx.fill();
+                            canvasCtx.restore();
+
+                            if (lastPositions[handLabel]) {
+                                const lx = lastPositions[handLabel].x;
+                                const ly = lastPositions[handLabel].y;
+                                const dist = Math.hypot(ix - lx, iy - ly);
+                                const steps = Math.max(1, Math.floor(dist / 3));
+
+                                for (let s = 0; s <= steps; s++) {
+                                    const interpX = lx + (ix - lx) * (s / steps);
+                                    const interpY = ly + (iy - ly) * (s / steps);
+                                    for (let p = 0; p < 2; p++) {
+                                        trailParticles.push(new TrailParticle(interpX, interpY));
+                                    }
+                                }
+                            } else {
+                                for (let p = 0; p < 5; p++) {
+                                    trailParticles.push(new TrailParticle(ix, iy));
+                                }
+                            }
+                            lastPositions[handLabel] = { x: ix, y: iy };
+                        }
+                    } else {
+                        lastPositions[handLabel] = null;
+                    }
+                }
+            }
+
+            for (let label in lastPositions) {
+                if (!currentHands.includes(label)) {
+                    lastPositions[label] = null;
+                }
+            }
+
+            for (let label in handStates) {
+                if (!currentHands.includes(label)) {
+                    delete handStates[label];
+                }
+            }
+
+            const bothFistsDetected = (fistCount === 2);
+            if (bothFistsDetected) {
+                if (!globalTwoFistsIntended) {
+                    globalTwoFistsIntended = true;
+                    globalTwoFistsSince = Date.now();
+                }
+                const timeInState = Date.now() - globalTwoFistsSince;
+                const isCooldown = timeInState < 1000;
+
+                for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                    const landmarks = results.multiHandLandmarks[i];
+                    const states = getFingerStates(landmarks);
+                    const isFist = !states.index && !states.middle && !states.ring && !states.pinky;
+                    if (isFist) {
+                        const palmX = landmarks[9].x * width;
+                        const palmY = landmarks[9].y * height;
+
+                        canvasCtx.save();
+                        canvasCtx.globalAlpha = 0.5;
+                        canvasCtx.fillStyle = isCooldown ? "#000000" : "#ff0055";
+                        canvasCtx.beginPath();
+                        canvasCtx.arc(palmX, palmY, 60, 0, Math.PI * 2);
+                        canvasCtx.fill();
+                        canvasCtx.restore();
+                    }
+                }
+
+                isTwoFistsActive = !isCooldown;
+            } else {
+                globalTwoFistsIntended = false;
+                isTwoFistsActive = false;
+            }
+
+            if (isTwoFistsActive) {
+                // Spawn a large number of hearts
+                for (let i = 0; i < 8; i++) {
+                    let newHeart = new FloatingHeart(Math.random() * width, height + 50);
+                    if (Math.random() > 0.4) {
+                        newHeart.y = Math.random() * height;
+                        newHeart.scale = 0;
+                    }
+                    backgroundHearts.push(newHeart);
+                }
+            }
+
+            // Increased max particles so they can actually stay for a minute without being overwritten
+            if (trailParticles.length > 15000) {
+                trailParticles.splice(0, trailParticles.length - 15000);
+            }
+
+            if (backgroundHearts.length > 500) {
+                backgroundHearts.splice(0, backgroundHearts.length - 500);
+            }
+
+            for (let i = backgroundHearts.length - 1; i >= 0; i--) {
+                let h = backgroundHearts[i];
+                h.update();
+                h.draw();
+                if (h.y < -50) {
+                    if (isTwoFistsActive) {
+                        h.y = height + 50;
+                        h.x = Math.random() * width;
+                    } else {
+                        backgroundHearts.splice(i, 1);
+                    }
+                }
+            }
+
+            for (let i = trailParticles.length - 1; i >= 0; i--) {
+                let p = trailParticles[i];
+                p.update();
+                p.draw();
+                if (p.alpha <= 0) {
+                    trailParticles.splice(i, 1);
+                }
+            }
+        }
+
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 2, // Allow tracking both hands
+            modelComplexity: 1,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+
+        hands.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 1280,
+            height: 720
+        });
+
+        camera.start();
+    </script>
+</body>
+
+</html>
